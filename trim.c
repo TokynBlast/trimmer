@@ -32,10 +32,80 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stdint.h>
 
 #define alw_inl __attribute__((always_inline)) inline
 #define CHUNK_SIZE 65536
 #define THRESHOLD 10
+
+/*
+ * 512-bit integer for cosmic-scale file sizes.
+ * Enough for 10^154 bytes.
+ */
+typedef struct { uint64_t w[8]; } bigoff_t;
+#define BIGOFF_BITS 512
+
+static inline bigoff_t off_to_bigoff(off_t x) {
+  bigoff_t r = {{0}};
+  r.w[0] = (uint64_t)x;
+  return r;
+}
+
+static inline off_t bigoff_to_off(bigoff_t x) {
+  return (off_t)x.w[0];
+}
+
+static inline bigoff_t bigoff_add(bigoff_t a, uint64_t b) {
+  bigoff_t r = a;
+  uint64_t carry = b;
+  for (int i = 0; i < 8 && carry; i++) {
+    uint64_t sum = r.w[i] + carry;
+    carry = (sum < r.w[i]) ? 1 : 0;
+    r.w[i] = sum;
+  }
+  return r;
+}
+
+static inline int bigoff_lt(bigoff_t a, bigoff_t b) {
+  for (int i = 7; i >= 0; i--) {
+    if (a.w[i] < b.w[i]) return 1;
+    if (a.w[i] > b.w[i]) return 0;
+  }
+  return 0;
+}
+
+static inline bigoff_t bigoff_sub_u64(bigoff_t a, uint64_t b) {
+  bigoff_t r = a;
+  if (r.w[0] >= b) { r.w[0] -= b; return r; }
+  r.w[0] -= b;
+  for (int i = 1; i < 8; i++) {
+    if (r.w[i] > 0) { r.w[i]--; break; }
+    r.w[i] = UINT64_MAX;
+  }
+  return r;
+}
+
+typedef struct {
+  bigoff_t val;
+  pthread_spinlock_t lock;
+} atomic_bigoff_t;
+
+static inline void atomic_bigoff_init(atomic_bigoff_t *a, bigoff_t v) {
+  a->val = v;
+  pthread_spin_init(&a->lock, PTHREAD_PROCESS_PRIVATE);
+}
+
+static inline bigoff_t atomic_bigoff_fetch_add(atomic_bigoff_t *a, uint64_t v) {
+  pthread_spin_lock(&a->lock);
+  bigoff_t old = a->val;
+  a->val = bigoff_add(a->val, v);
+  pthread_spin_unlock(&a->lock);
+  return old;
+}
+
+static inline void atomic_bigoff_destroy(atomic_bigoff_t *a) {
+  pthread_spin_destroy(&a->lock);
+}
 
 static int no_bin = 0;
 
@@ -137,8 +207,8 @@ static alw_inl int calculate_content_score(const unsigned char *buf, size_t len)
 typedef struct {
   int fd_in;
   int fd_out;
-  _Atomic off_t offset;
-  off_t total_size;
+  atomic_bigoff_t offset;
+  bigoff_t total_size;
   pthread_mutex_t write_mtx;
 } FileJob;
 
@@ -152,21 +222,24 @@ static void* stream_worker(void* arg) {
   if (!buf) return NULL;
 
   while (1) {
-    off_t start = atomic_fetch_add(&job->offset, CHUNK_SIZE);
-    if (start >= job->total_size) break;
+    bigoff_t start = atomic_bigoff_fetch_add(&job->offset, CHUNK_SIZE);
+    if (!bigoff_lt(start, job->total_size)) break;
 
-    size_t to_read = (job->total_size - start < CHUNK_SIZE) ?
-             (size_t)(job->total_size - start) : CHUNK_SIZE;
+    bigoff_t remaining = bigoff_sub_u64(job->total_size, bigoff_to_off(start));
+    size_t to_read = (remaining.w[0] < CHUNK_SIZE && remaining.w[1] == 0) ?
+             (size_t)remaining.w[0] : CHUNK_SIZE;
 
-    if (pread(job->fd_in, buf, to_read, start) != (ssize_t)to_read) break;
+    if (pread(job->fd_in, buf, to_read, bigoff_to_off(start)) != (ssize_t)to_read) break;
 
+    bigoff_t end_pos = bigoff_sub_u64(job->total_size, 1);
     for (size_t i = 0; i < to_read; i++) {
-      // If we hit a newline or the absolute end of file, check for trailing whitespace
-      if (buf[i] == '\n' || ((off_t)(start + i) == job->total_size - 1)) {
-        ssize_t end = (buf[i] == '\n') ? (ssize_t)i - 1 : (ssize_t)i;
-        while (end >= 0 && (buf[end] == ' ' || buf[end] == '\t')) {
-          buf[end] = '\0'; // Mark for exclusion during write
-          end--;
+      bigoff_t cur_pos = bigoff_add(start, i);
+      int at_end = (cur_pos.w[0] == end_pos.w[0]) && (cur_pos.w[1] == end_pos.w[1]);
+      if (buf[i] == '\n' || at_end) {
+        ssize_t e = (buf[i] == '\n') ? (ssize_t)i - 1 : (ssize_t)i;
+        while (e >= 0 && (buf[e] == ' ' || buf[e] == '\t')) {
+          buf[e] = '\0';
+          e--;
         }
       }
     }
@@ -174,7 +247,7 @@ static void* stream_worker(void* arg) {
     pthread_mutex_lock(&job->write_mtx);
     for(size_t i = 0; i < to_read; i++) {
       if (buf[i] != '\0' || (i < to_read - 1 && buf[i+1] == '\n')) {
-         pwrite(job->fd_out, &buf[i], 1, start + i);
+         pwrite(job->fd_out, &buf[i], 1, bigoff_to_off(bigoff_add(start, i)));
       }
     }
     pthread_mutex_unlock(&job->write_mtx);
@@ -201,13 +274,13 @@ static alw_inl void process_file(const char *path, struct stat *st) {
     lseek(fd, 0, SEEK_SET);
   }
 
-  char tmp[PATH_MAX];
+  char tmp[PATH_MAX + 16];
   snprintf(tmp, sizeof(tmp), "%s.XXXXXX", path);
   int out_fd = mkstemp(tmp);
   if (out_fd == -1) { close(fd); return; }
 
-  FileJob job = { .fd_in = fd, .fd_out = out_fd, .total_size = st->st_size };
-  atomic_init(&job.offset, 0);
+  FileJob job = { .fd_in = fd, .fd_out = out_fd, .total_size = off_to_bigoff(st->st_size) };
+  atomic_bigoff_init(&job.offset, off_to_bigoff(0));
   pthread_mutex_init(&job.write_mtx, NULL);
 
   pthread_t t1, t2;
@@ -216,13 +289,13 @@ static alw_inl void process_file(const char *path, struct stat *st) {
   pthread_join(t1, NULL);
   pthread_join(t2, NULL);
 
+  atomic_bigoff_destroy(&job.offset);
   pthread_mutex_destroy(&job.write_mtx);
   close(fd);
   close(out_fd);
 
   chmod(tmp, st->st_mode & 0777);
   rename(tmp, path);
-  printf("[Ruri/Mei] Cleaned: %s (Conf: %d)\n", path, confidence);
 }
 
 void walk_directory(const char *dir_name) {
@@ -251,7 +324,11 @@ int main(int argc, char **argv) {
   const char *start_node = ".";
 
   for (int i = 1; i < argc; i++) {
-    if (strcmp(argv[i], "--no-bin") == 0) {
+    if (strcmp(argv[i], "--help") == 0) {
+      printf("Trim is a super fast, super safe, fuzzy-logic whitespace cleaner.\n\n--no-bin -> tells the cleaner, assume trailing whitespace will never ever exist\n--version -> prints current version");
+    } else if (strcmp(argv[i], "--version")) {
+      printf("trim v0.1.0\nCopyright (C) 2026 Ruri / Mei\nUnder GNU General Public License V3 or later.");
+    } else if (strcmp(argv[i], "--no-bin") == 0) {
       no_bin = 1;
     } else {
       start_node = argv[i];
