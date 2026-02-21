@@ -1,5 +1,5 @@
 /*
- * trimmer.c - A high-performance, streaming, fuzzy-logic whitespace cleaner.
+ * trimmer.c - A high-performance, incredibly safe, streaming, fuzzy-logic whitespace cleaner.
  * Copyright (C) 2026 Ruri / Mei
  *
  * This program is free software: you can redistribute it and/or modify
