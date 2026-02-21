@@ -37,6 +37,8 @@
 #define CHUNK_SIZE 65536
 #define THRESHOLD 10
 
+static int no_bin = 0;
+
 /* * Check extensions to avoid touching things that definitely shouldn't
  * be messed with (like compressed audio, ROMs, or compiled binaries).
  */
@@ -185,14 +187,18 @@ static alw_inl void process_file(const char *path, struct stat *st) {
   int fd = open(path, O_RDONLY | O_NOFOLLOW);
   if (fd == -1) return;
 
-  unsigned char head[4096];
-  ssize_t r = read(fd, head, sizeof(head));
-  int confidence = get_ext_confidence(path);
-  if (r > 0) confidence += calculate_content_score(head, r);
+  int confidence = 100;
+  if (!no_bin) {
+    unsigned char head[4096];
+    ssize_t r = read(fd, head, sizeof(head));
+    confidence = get_ext_confidence(path);
+    if (r > 0) confidence += calculate_content_score(head, r);
 
-  if (confidence < THRESHOLD) {
-    close(fd);
-    return;
+    if (confidence < THRESHOLD) {
+      close(fd);
+      return;
+    }
+    lseek(fd, 0, SEEK_SET);
   }
 
   char tmp[PATH_MAX];
@@ -242,7 +248,15 @@ void walk_directory(const char *dir_name) {
 }
 
 int main(int argc, char **argv) {
-  const char *start_node = (argc > 1) ? argv[1] : ".";
+  const char *start_node = ".";
+
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "--no-bin") == 0) {
+      no_bin = 1;
+    } else {
+      start_node = argv[i];
+    }
+  }
 
   struct stat st;
   if (lstat(start_node, &st) == -1) {
